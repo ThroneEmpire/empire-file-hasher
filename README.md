@@ -44,16 +44,26 @@ build/libs/empire-file-hasher.jar
 
 ## Usage
 
-By default the program operates on **the directory you launch it from**.
-Optionally pass a directory as the first argument to point it elsewhere.
+```
+empire-file-hasher [DIR] [-t N | --threads N]
+```
+
+- `DIR` — directory to hash. Defaults to the current working directory.
+- `-t N` / `--threads N` — number of hashing threads. Defaults to `1`.
+  Increase for fast storage (NVMe / SSD) to overlap I/O with hashing.
+  Leave at `1` for spinning disks or network mounts, where seek contention
+  usually makes parallel hashing *slower*.
 
 ```
-# hash the current directory
+# hash the current directory, single-threaded (default)
 cd /path/to/archive
 java -jar /path/to/empire-file-hasher/build/libs/empire-file-hasher.jar
 
 # hash a specific directory
 java -jar /path/to/empire-file-hasher/build/libs/empire-file-hasher.jar /path/to/archive
+
+# hash with 8 threads (good for SSD/NVMe)
+java -jar /path/to/empire-file-hasher/build/libs/empire-file-hasher.jar /path/to/archive -t 8
 ```
 
 First run:
@@ -90,10 +100,19 @@ The report flags four states per file:
 - **MISSING** — file listed in manifest but not found on disk.
 - **NEW** — file on disk that wasn't in the manifest (added after hashing).
 
+### Rehashing
+
+Choosing `r` at the prompt overwrites `hashes.db`, so it's guarded by an
+extra "are you sure?" confirmation. Before the new manifest is written,
+the old one is copied to `hashes.db.bak`. If a `.bak` already exists, the
+backup is timestamped (`hashes.db.bak.20260422-172334`) so previous
+snapshots are never lost.
+
 
 ## Notes
 
-- `hashes.db` itself is excluded from hashing and verification.
+- `hashes.db` and any `hashes.db.bak*` backups in the root are excluded
+  from hashing and verification.
 - Paths in the manifest are stored relative to the root directory and always
   use forward slashes, so a manifest produced on Windows will verify on
   Linux and vice-versa.
