@@ -10,12 +10,14 @@ import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.*;
 import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Stream;
 
 public class Main {
 
     private static final String DB_FILENAME = "hashes.db";
+    private static final String PARTIAL_SUFFIX = ".partial";
     private static final int BUFFER_SIZE = 1 << 16; // 64 KiB
 
     public static void main(String[] args) throws Exception {
@@ -65,10 +67,31 @@ public class Main {
         System.out.println();
 
         try (BufferedReader in = new BufferedReader(new InputStreamReader(System.in, StandardCharsets.UTF_8))) {
+            Path partial = root.resolve(DB_FILENAME + PARTIAL_SUFFIX);
+            if (Files.exists(partial)) {
+                Map<String, String> prior = loadManifest(partial);
+                System.out.println("Found a partial hash from a previous interrupted run: "
+                        + partial.getFileName() + " (" + prior.size() + " entries)");
+                System.out.println("  [r] resume — continue hashing the remaining files");
+                System.out.println("  [d] discard the partial and start over");
+                System.out.println("  [q] quit");
+                System.out.print("Choice: ");
+                String choice = in.readLine();
+                if (choice == null) return;
+                switch (choice.trim().toLowerCase(Locale.ROOT)) {
+                    case "r" -> { hashAll(root, db, threads, prior); return; }
+                    case "d" -> {
+                        Files.delete(partial);
+                        System.out.println("Partial discarded.");
+                    }
+                    default -> { System.out.println("Exiting."); return; }
+                }
+            }
+
             if (!Files.exists(db)) {
                 System.out.println("No hashes.db found in this directory.");
                 if (confirm(in, "Do you want to hash every file here (recursively) and create one? [y/N]: ")) {
-                    hashAll(root, db, threads);
+                    hashAll(root, db, threads, null);
                 } else {
                     System.out.println("Nothing to do. Exiting.");
                 }
@@ -89,7 +112,7 @@ public class Main {
                         if (confirm(in, "Are you sure you want to rehash everything? [y/N]: ")) {
                             Path backup = backupDb(db);
                             System.out.println("Backed up existing manifest to " + backup.getFileName());
-                            hashAll(root, db, threads);
+                            hashAll(root, db, threads, null);
                         } else {
                             System.out.println("Rehash cancelled.");
                         }
@@ -120,26 +143,68 @@ public class Main {
         return line != null && line.trim().equalsIgnoreCase("y");
     }
 
-    private static void hashAll(Path root, Path db, int threads) throws Exception {
-        List<Path> files = collectFiles(root);
-        int total = files.size();
-        System.out.println("Found " + total + " files. Hashing with " + threads + (threads == 1 ? " thread..." : " threads..."));
+    private static void hashAll(Path root, Path db, int threads, Map<String, String> prior) throws Exception {
+        Path partial = root.resolve(DB_FILENAME + PARTIAL_SUFFIX);
+        List<Path> allFiles = collectFiles(root);
 
-        String[] lines = new String[total];
+        // If resuming, drop any prior entries whose files no longer exist on disk.
+        if (prior != null) {
+            int before = prior.size();
+            prior.keySet().removeIf(rel -> !Files.exists(root.resolve(rel)));
+            int dropped = before - prior.size();
+            if (dropped > 0) System.out.println("Dropped " + dropped + " partial entries whose files no longer exist.");
+        }
+
+        List<Path> todo = new ArrayList<>();
+        for (Path p : allFiles) {
+            String rel = toRelative(root, p);
+            if (prior == null || !prior.containsKey(rel)) todo.add(p);
+        }
+
+        int total = todo.size();
+        int already = prior == null ? 0 : prior.size();
+        if (prior != null) {
+            System.out.println("Resuming: " + already + " already hashed, " + total + " remaining.");
+        }
+        System.out.println("Hashing " + total + " files with " + threads + (threads == 1 ? " thread..." : " threads..."));
+
+        String[] newLines = new String[total];
         AtomicInteger done = new AtomicInteger();
+        AtomicBoolean completed = new AtomicBoolean(false);
+
+        Thread hook = new Thread(() -> {
+            if (completed.get()) return;
+            try {
+                Map<String, String> snapshot = new LinkedHashMap<>();
+                if (prior != null) snapshot.putAll(prior);
+                for (String s : newLines) {
+                    if (s == null) continue;
+                    int sep = s.indexOf("  ");
+                    if (sep > 0) snapshot.put(s.substring(sep + 2), s.substring(0, sep));
+                }
+                writeManifest(partial, snapshot);
+                System.err.println();
+                System.err.println("Interrupted. Saved " + snapshot.size()
+                        + " entries to " + partial.getFileName() + ". Run again to resume.");
+            } catch (IOException e) {
+                System.err.println("Failed to save partial: " + e);
+            }
+        }, "file-hasher-shutdown");
+        Runtime.getRuntime().addShutdownHook(hook);
+
         ExecutorService pool = Executors.newFixedThreadPool(threads);
         try {
             List<Future<?>> futures = new ArrayList<>(total);
             for (int idx = 0; idx < total; idx++) {
                 final int slot = idx;
-                final Path p = files.get(idx);
+                final Path p = todo.get(idx);
                 futures.add(pool.submit(() -> {
                     String rel = toRelative(root, p);
                     String digest = sha256(p);
-                    lines[slot] = digest + "  " + rel;
+                    newLines[slot] = digest + "  " + rel;
                     int n = done.incrementAndGet();
                     synchronized (System.out) {
-                        System.out.printf("  [%d/%d] %s%n", n, total, rel);
+                        System.out.printf("  [%d/%d] %s%n", n + already, allFiles.size(), rel);
                     }
                     return null;
                 }));
@@ -149,9 +214,39 @@ public class Main {
             pool.shutdownNow();
         }
 
-        Files.write(db, Arrays.asList(lines), StandardCharsets.UTF_8,
+        Map<String, String> finalMap = new LinkedHashMap<>();
+        if (prior != null) finalMap.putAll(prior);
+        for (String s : newLines) {
+            if (s == null) continue;
+            int sep = s.indexOf("  ");
+            finalMap.put(s.substring(sep + 2), s.substring(0, sep));
+        }
+        writeManifest(db, finalMap);
+        Files.deleteIfExists(partial);
+        completed.set(true);
+        try { Runtime.getRuntime().removeShutdownHook(hook); } catch (IllegalStateException ignored) {}
+
+        System.out.println("Wrote " + finalMap.size() + " hashes to " + db.getFileName());
+    }
+
+    private static Map<String, String> loadManifest(Path p) throws IOException {
+        Map<String, String> out = new LinkedHashMap<>();
+        for (String line : Files.readAllLines(p, StandardCharsets.UTF_8)) {
+            if (line.isBlank()) continue;
+            int sep = line.indexOf("  ");
+            if (sep < 0) continue;
+            out.put(line.substring(sep + 2), line.substring(0, sep));
+        }
+        return out;
+    }
+
+    private static void writeManifest(Path p, Map<String, String> entries) throws IOException {
+        List<String> keys = new ArrayList<>(entries.keySet());
+        Collections.sort(keys);
+        List<String> lines = new ArrayList<>(keys.size());
+        for (String k : keys) lines.add(entries.get(k) + "  " + k);
+        Files.write(p, lines, StandardCharsets.UTF_8,
                 StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
-        System.out.println("Wrote " + total + " hashes to " + db.getFileName());
     }
 
     private static void verify(Path root, Path db, int threads) throws Exception {
@@ -265,7 +360,9 @@ public class Main {
     private static boolean isManifestFile(Path root, Path p) {
         if (!p.getParent().equals(root)) return false;
         String name = p.getFileName().toString();
-        return name.equals(DB_FILENAME) || name.startsWith(DB_FILENAME + ".bak");
+        return name.equals(DB_FILENAME)
+                || name.startsWith(DB_FILENAME + ".bak")
+                || name.equals(DB_FILENAME + PARTIAL_SUFFIX);
     }
 
     private static String toRelative(Path root, Path p) {

@@ -100,6 +100,27 @@ The report flags four states per file:
 - **MISSING** — file listed in manifest but not found on disk.
 - **NEW** — file on disk that wasn't in the manifest (added after hashing).
 
+### Interrupting a long run
+
+You can safely Ctrl-C at any point during hashing — especially useful for
+archives with tens of thousands of files where a full run takes hours.
+On SIGINT the program writes whatever has finished to `hashes.db.partial`
+and exits cleanly. `hashes.db` itself is only written as a single atomic
+step at the end of a successful run, so it can never be half-written.
+
+Next launch detects the partial and prompts:
+
+```
+Found a partial hash from a previous interrupted run: hashes.db.partial (4812 entries)
+  [r] resume — continue hashing the remaining files
+  [d] discard the partial and start over
+  [q] quit
+```
+
+Resuming only hashes files not already in the partial. Files that were in
+the partial but no longer exist on disk are silently dropped (you'll see a
+"Dropped N partial entries" line if any).
+
 ### Rehashing
 
 Choosing `r` at the prompt overwrites `hashes.db`, so it's guarded by an
