@@ -45,7 +45,8 @@ build/libs/empire-file-hasher.jar
 ## Usage
 
 ```
-empire-file-hasher [DIR] [-t N | --threads N]
+empire-file-hasher [DIR] [options]
+empire-file-hasher --diff OLD.db NEW.db
 ```
 
 - `DIR` — directory to hash. Defaults to the current working directory.
@@ -53,6 +54,23 @@ empire-file-hasher [DIR] [-t N | --threads N]
   Increase for fast storage (NVMe / SSD) to overlap I/O with hashing.
   Leave at `1` for spinning disks or network mounts, where seek contention
   usually makes parallel hashing *slower*.
+- `-i PATH` / `--ignore PATH` — skip a path. Repeatable. A trailing `/`
+  matches a directory subtree; otherwise the entry matches that exact file
+  or directory. See [Ignoring files](#ignoring-files) below.
+- `-q` / `--quiet` — suppress per-file output and the progress line.
+  Final report still prints. Combine with the `update` mode's exit code
+  for cron / CI use.
+- `-v` / `--verbose` — print every file as it's processed (the old default
+  behavior). Useful when piping to a log.
+- `--diff OLD.db NEW.db` — compare two manifest files and print added /
+  removed / changed paths. See [Diffing manifests](#diffing-manifests).
+
+By default (no `-q`/`-v`), hashing and verification print a single
+self-updating progress line `[N/total] XX.X%` instead of one line per
+file — much friendlier for archives with tens of thousands of entries.
+
+**Exit codes**: `0` on success, `1` on integrity failure (verify found
+mismatches/missing, or `--diff` found differences), `2` on argument errors.
 
 ```
 # hash the current directory, single-threaded (default)
@@ -82,6 +100,7 @@ Later, to check nothing has rotted:
 ```
 hashes.db exists.
   [v] verify existing files against hashes.db
+  [u] update — verify, then add new files and drop missing entries
   [r] rehash everything and overwrite hashes.db
   [q] quit
 Choice: v
@@ -121,6 +140,95 @@ Resuming only hashes files not already in the partial. Files that were in
 the partial but no longer exist on disk are silently dropped (you'll see a
 "Dropped N partial entries" line if any).
 
+Ctrl-C is **safe at any point in any mode** — `hashes.db` is written via
+an atomic temp-file rename, so it is never left half-written. The
+resume-from-partial behavior currently applies to first-time hashing,
+rehashing, and resuming — *not* to the "add new files" step of update
+mode. Update is still safe to interrupt (the original manifest is
+untouched until the very end), but new-file hashes from an interrupted
+update run are not preserved.
+
+### Ignoring files
+
+You can exclude paths from hashing and from the "new/extra" check during
+verification. Two sources are supported and merged together:
+
+**1. CLI flag** — `-i` / `--ignore`, repeatable:
+
+```
+java -jar empire-file-hasher.jar /path/to/archive \
+    --ignore ./build/ \
+    --ignore node_modules/ \
+    -i secrets.txt
+```
+
+**2. `.hashignore` file** at the root of the directory being hashed —
+one entry per line. Blank lines and lines starting with `#` are ignored:
+
+```
+# build artifacts
+build/
+node_modules/
+
+# local-only files
+secrets.txt
+scratch/
+```
+
+Matching rules (intentionally simple — no globs or wildcards):
+- A trailing `/` means "this directory and everything under it".
+- Without a trailing `/`, the entry matches that exact relative path. If it
+  happens to be a directory, its contents are also ignored.
+- Leading `./` and `/` are stripped; backslashes are normalized to `/`,
+  so Windows-style entries work.
+
+Ignores apply to fresh hashing and to verification's "new/extra" detection.
+Entries already recorded in `hashes.db` are still verified against disk —
+if you want them dropped, rehash after adding the ignore.
+
+### Update mode
+
+The `[u]` option is the everyday "I added/removed some files, sync the
+manifest" flow. It runs a full verify pass first, then prompts:
+
+- **Add new files?** — hashes any files on disk that aren't in the manifest
+  and inserts them.
+- **Remove missing entries?** — drops manifest entries for files that no
+  longer exist on disk.
+
+**MISMATCH entries are never auto-updated.** If a file's bytes differ from
+its recorded hash, that's exactly the kind of corruption this tool exists
+to catch — silently overwriting the hash would defeat the point. Resolve
+mismatches manually (restore from backup) or use `[r]` rehash if you
+intend to declare the current bytes the new truth.
+
+The previous manifest is backed up to `hashes.db.bak` (timestamped if a
+backup already exists) before the new one is written.
+
+### Diffing manifests
+
+```
+empire-file-hasher --diff hashes.db.bak hashes.db
+```
+
+Compares two manifests without re-reading any files — useful for
+"what changed between snapshots?" without paying for another full hash
+pass. Output:
+
+```
+Diff: hashes.db.bak -> hashes.db
+Added   : 2
+Removed : 1
+Changed : 1
+  + photos/new.jpg
+  + notes/2026-05.md
+  - scratch/old.tmp
+  ~ docs/spec.pdf
+```
+
+`+` added in the new manifest, `-` removed, `~` same path but different
+hash. Exits `1` if any differences exist (handy for cron alerts).
+
 ### Rehashing
 
 Choosing `r` at the prompt overwrites `hashes.db`, so it's guarded by an
@@ -133,7 +241,9 @@ snapshots are never lost.
 ## Notes
 
 - `hashes.db` and any `hashes.db.bak*` backups in the root are excluded
-  from hashing and verification.
+  from hashing and verification. The `.hashignore` file itself is **not**
+  auto-excluded — add it to its own ignore list if you don't want it
+  hashed alongside your data.
 - Paths in the manifest are stored relative to the root directory and always
   use forward slashes, so a manifest produced on Windows will verify on
   Linux and vice-versa.

@@ -12,20 +12,38 @@ import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReferenceArray;
 import java.util.stream.Stream;
 
 public class Main {
 
     private static final String DB_FILENAME = "hashes.db";
+    private static final String IGNORE_FILENAME = ".hashignore";
     private static final String PARTIAL_SUFFIX = ".partial";
     private static final int BUFFER_SIZE = 1 << 16; // 64 KiB
+
+    enum Verbosity { QUIET, NORMAL, VERBOSE }
 
     public static void main(String[] args) throws Exception {
         String dirArg = null;
         int threads = 1;
+        List<String> ignoreArgs = new ArrayList<>();
+        Verbosity verbosity = Verbosity.NORMAL;
+        String diffA = null, diffB = null;
         for (int i = 0; i < args.length; i++) {
             String a = args[i];
-            if (a.equals("-t") || a.equals("--threads")) {
+            if (a.equals("--diff")) {
+                if (i + 2 >= args.length) {
+                    System.err.println("--diff requires two manifest paths: --diff OLD.db NEW.db");
+                    System.exit(2);
+                }
+                diffA = args[++i];
+                diffB = args[++i];
+            } else if (a.equals("-q") || a.equals("--quiet")) {
+                verbosity = Verbosity.QUIET;
+            } else if (a.equals("-v") || a.equals("--verbose")) {
+                verbosity = Verbosity.VERBOSE;
+            } else if (a.equals("-t") || a.equals("--threads")) {
                 if (i + 1 >= args.length) {
                     System.err.println("Missing value for " + a);
                     System.exit(2);
@@ -40,10 +58,23 @@ public class Main {
                     System.err.println("Thread count must be >= 1");
                     System.exit(2);
                 }
+            } else if (a.equals("-i") || a.equals("--ignore")) {
+                if (i + 1 >= args.length) {
+                    System.err.println("Missing value for " + a);
+                    System.exit(2);
+                }
+                ignoreArgs.add(args[++i]);
             } else if (a.equals("-h") || a.equals("--help")) {
-                System.out.println("Usage: empire-file-hasher [DIR] [-t N | --threads N]");
-                System.out.println("  DIR          directory to hash (default: current directory)");
-                System.out.println("  -t, --threads  number of hashing threads (default: 1)");
+                System.out.println("Usage: empire-file-hasher [DIR] [options]");
+                System.out.println("       empire-file-hasher --diff OLD.db NEW.db");
+                System.out.println();
+                System.out.println("  DIR              directory to hash (default: current directory)");
+                System.out.println("  -t, --threads    number of hashing threads (default: 1)");
+                System.out.println("  -i, --ignore     path to ignore (repeatable). Trailing / matches a directory subtree.");
+                System.out.println("                   Also reads patterns from .hashignore at the root if present.");
+                System.out.println("  -q, --quiet      suppress per-file output and progress");
+                System.out.println("  -v, --verbose    print every file as it is processed (default: progress line only)");
+                System.out.println("  --diff           compare two manifest files and print differences");
                 return;
             } else if (dirArg == null) {
                 dirArg = a;
@@ -53,6 +84,11 @@ public class Main {
             }
         }
 
+        if (diffA != null) {
+            diffManifests(Paths.get(diffA), Paths.get(diffB));
+            return;
+        }
+
         Path root = (dirArg != null ? Paths.get(dirArg) : Paths.get("")).toAbsolutePath().normalize();
         if (!Files.isDirectory(root)) {
             System.err.println("Not a directory: " + root);
@@ -60,10 +96,26 @@ public class Main {
         }
         Path db = root.resolve(DB_FILENAME);
 
+        List<String> ignores = new ArrayList<>();
+        Path ignoreFile = root.resolve(IGNORE_FILENAME);
+        if (Files.exists(ignoreFile)) {
+            for (String line : Files.readAllLines(ignoreFile, StandardCharsets.UTF_8)) {
+                String t = line.trim();
+                if (t.isEmpty() || t.startsWith("#")) continue;
+                ignores.add(t);
+            }
+        }
+        ignores.addAll(ignoreArgs);
+        List<String> normalizedIgnores = normalizeIgnores(ignores);
+
         System.out.println("File Hasher");
         System.out.println("Working directory: " + root);
         System.out.println("Hash database:     " + db);
         System.out.println("Threads:           " + threads);
+        if (!normalizedIgnores.isEmpty()) {
+            System.out.println("Ignoring:");
+            for (String ig : normalizedIgnores) System.out.println("  " + ig);
+        }
         System.out.println();
 
         try (BufferedReader in = new BufferedReader(new InputStreamReader(System.in, StandardCharsets.UTF_8))) {
@@ -79,7 +131,7 @@ public class Main {
                 String choice = in.readLine();
                 if (choice == null) return;
                 switch (choice.trim().toLowerCase(Locale.ROOT)) {
-                    case "r" -> { hashAll(root, db, threads, prior); return; }
+                    case "r" -> { hashAll(root, db, threads, prior, normalizedIgnores, verbosity); return; }
                     case "d" -> {
                         Files.delete(partial);
                         System.out.println("Partial discarded.");
@@ -91,20 +143,22 @@ public class Main {
             if (!Files.exists(db)) {
                 System.out.println("No hashes.db found in this directory.");
                 if (confirm(in, "Do you want to hash every file here (recursively) and create one? [y/N]: ")) {
-                    hashAll(root, db, threads, null);
+                    hashAll(root, db, threads, null, normalizedIgnores, verbosity);
                 } else {
                     System.out.println("Nothing to do. Exiting.");
                 }
             } else {
                 System.out.println("hashes.db exists.");
                 System.out.println("  [v] verify existing files against hashes.db");
+                System.out.println("  [u] update — verify, then add new files and drop missing entries");
                 System.out.println("  [r] rehash everything and overwrite hashes.db");
                 System.out.println("  [q] quit");
                 System.out.print("Choice: ");
                 String choice = in.readLine();
                 if (choice == null) return;
                 switch (choice.trim().toLowerCase(Locale.ROOT)) {
-                    case "v" -> verify(root, db, threads);
+                    case "v" -> verify(root, db, threads, normalizedIgnores, verbosity);
+                    case "u" -> update(root, db, threads, normalizedIgnores, verbosity, in);
                     case "r" -> {
                         System.out.println();
                         System.out.println("WARNING: rehashing will overwrite the existing hashes.db.");
@@ -112,7 +166,7 @@ public class Main {
                         if (confirm(in, "Are you sure you want to rehash everything? [y/N]: ")) {
                             Path backup = backupDb(db);
                             System.out.println("Backed up existing manifest to " + backup.getFileName());
-                            hashAll(root, db, threads, null);
+                            hashAll(root, db, threads, null, normalizedIgnores, verbosity);
                         } else {
                             System.out.println("Rehash cancelled.");
                         }
@@ -143,9 +197,9 @@ public class Main {
         return line != null && line.trim().equalsIgnoreCase("y");
     }
 
-    private static void hashAll(Path root, Path db, int threads, Map<String, String> prior) throws Exception {
+    private static void hashAll(Path root, Path db, int threads, Map<String, String> prior, List<String> ignores, Verbosity verbosity) throws Exception {
         Path partial = root.resolve(DB_FILENAME + PARTIAL_SUFFIX);
-        List<Path> allFiles = collectFiles(root);
+        List<Path> allFiles = collectFiles(root, ignores);
 
         // If resuming, drop any prior entries whose files no longer exist on disk.
         if (prior != null) {
@@ -168,30 +222,34 @@ public class Main {
         }
         System.out.println("Hashing " + total + " files with " + threads + (threads == 1 ? " thread..." : " threads..."));
 
-        String[] newLines = new String[total];
-        AtomicInteger done = new AtomicInteger();
+        AtomicReferenceArray<String> newLines = new AtomicReferenceArray<>(total);
         AtomicBoolean completed = new AtomicBoolean(false);
+        Object finalizeLock = new Object();
 
         Thread hook = new Thread(() -> {
-            if (completed.get()) return;
-            try {
-                Map<String, String> snapshot = new LinkedHashMap<>();
-                if (prior != null) snapshot.putAll(prior);
-                for (String s : newLines) {
-                    if (s == null) continue;
-                    int sep = s.indexOf("  ");
-                    if (sep > 0) snapshot.put(s.substring(sep + 2), s.substring(0, sep));
+            synchronized (finalizeLock) {
+                if (completed.get()) return;
+                try {
+                    Map<String, String> snapshot = new LinkedHashMap<>();
+                    if (prior != null) snapshot.putAll(prior);
+                    for (int i = 0; i < newLines.length(); i++) {
+                        String s = newLines.get(i);
+                        if (s == null) continue;
+                        int sep = s.indexOf("  ");
+                        if (sep > 0) snapshot.put(s.substring(sep + 2), s.substring(0, sep));
+                    }
+                    writeManifestAtomic(partial, snapshot);
+                    System.err.println();
+                    System.err.println("Interrupted. Saved " + snapshot.size()
+                            + " entries to " + partial.getFileName() + ". Run again to resume.");
+                } catch (IOException e) {
+                    System.err.println("Failed to save partial: " + e);
                 }
-                writeManifest(partial, snapshot);
-                System.err.println();
-                System.err.println("Interrupted. Saved " + snapshot.size()
-                        + " entries to " + partial.getFileName() + ". Run again to resume.");
-            } catch (IOException e) {
-                System.err.println("Failed to save partial: " + e);
             }
         }, "file-hasher-shutdown");
         Runtime.getRuntime().addShutdownHook(hook);
 
+        final Progress prog = new Progress(allFiles.size(), verbosity, already);
         ExecutorService pool = Executors.newFixedThreadPool(threads);
         try {
             List<Future<?>> futures = new ArrayList<>(total);
@@ -201,11 +259,8 @@ public class Main {
                 futures.add(pool.submit(() -> {
                     String rel = toRelative(root, p);
                     String digest = sha256(p);
-                    newLines[slot] = digest + "  " + rel;
-                    int n = done.incrementAndGet();
-                    synchronized (System.out) {
-                        System.out.printf("  [%d/%d] %s%n", n + already, allFiles.size(), rel);
-                    }
+                    newLines.set(slot, digest + "  " + rel);
+                    prog.tick(rel);
                     return null;
                 }));
             }
@@ -213,20 +268,60 @@ public class Main {
         } finally {
             pool.shutdownNow();
         }
+        Progress.finish(verbosity);
 
         Map<String, String> finalMap = new LinkedHashMap<>();
         if (prior != null) finalMap.putAll(prior);
-        for (String s : newLines) {
+        for (int i = 0; i < newLines.length(); i++) {
+            String s = newLines.get(i);
             if (s == null) continue;
             int sep = s.indexOf("  ");
             finalMap.put(s.substring(sep + 2), s.substring(0, sep));
         }
-        writeManifest(db, finalMap);
-        Files.deleteIfExists(partial);
-        completed.set(true);
+
+        synchronized (finalizeLock) {
+            writeManifestAtomic(db, finalMap);
+            Files.deleteIfExists(partial);
+            completed.set(true);
+        }
         try { Runtime.getRuntime().removeShutdownHook(hook); } catch (IllegalStateException ignored) {}
 
-        System.out.println("Wrote " + finalMap.size() + " hashes to " + db.getFileName());
+        if (verbosity != Verbosity.QUIET) {
+            System.out.println("Wrote " + finalMap.size() + " hashes to " + db.getFileName());
+        }
+    }
+
+    private static class Progress {
+        final int total;
+        final Verbosity v;
+        final int baseOffset;
+        int count = 0;
+        Progress(int total, Verbosity v) { this(total, v, 0); }
+        Progress(int total, Verbosity v, int baseOffset) {
+            this.total = total;
+            this.v = v;
+            this.baseOffset = baseOffset;
+        }
+        void tick(String rel) {
+            if (v == Verbosity.QUIET) return;
+            synchronized (System.out) {
+                int n = ++count + baseOffset;
+                if (v == Verbosity.VERBOSE) {
+                    System.out.printf("  [%d/%d] %s%n", n, total, rel);
+                } else {
+                    double pct = total == 0 ? 100.0 : (100.0 * n / total);
+                    System.out.printf("\r  [%d/%d] %5.1f%%   ", n, total, pct);
+                    System.out.flush();
+                }
+            }
+        }
+        static void finish(Verbosity v) {
+            if (v == Verbosity.NORMAL) {
+                synchronized (System.out) {
+                    System.out.println();
+                }
+            }
+        }
     }
 
     private static Map<String, String> loadManifest(Path p) throws IOException {
@@ -240,16 +335,30 @@ public class Main {
         return out;
     }
 
-    private static void writeManifest(Path p, Map<String, String> entries) throws IOException {
+    private static void writeManifestAtomic(Path p, Map<String, String> entries) throws IOException {
         List<String> keys = new ArrayList<>(entries.keySet());
         Collections.sort(keys);
         List<String> lines = new ArrayList<>(keys.size());
         for (String k : keys) lines.add(entries.get(k) + "  " + k);
-        Files.write(p, lines, StandardCharsets.UTF_8,
+        Path tmp = p.resolveSibling(p.getFileName() + ".tmp");
+        Files.write(tmp, lines, StandardCharsets.UTF_8,
                 StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
+        try {
+            Files.move(tmp, p, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+        } catch (AtomicMoveNotSupportedException e) {
+            Files.move(tmp, p, StandardCopyOption.REPLACE_EXISTING);
+        }
     }
 
-    private static void verify(Path root, Path db, int threads) throws Exception {
+    private static class VerifyResult {
+        LinkedHashMap<String, String> expected;
+        List<String> mismatched = new ArrayList<>();
+        List<String> missing = new ArrayList<>();
+        List<String> extras = new ArrayList<>();
+        int ok;
+    }
+
+    private static VerifyResult runVerify(Path root, Path db, int threads, List<String> ignores, Verbosity verbosity) throws Exception {
         List<String> lines = Files.readAllLines(db, StandardCharsets.UTF_8);
         LinkedHashMap<String, String> expected = new LinkedHashMap<>();
         for (String line : lines) {
@@ -260,12 +369,13 @@ public class Main {
         }
 
         int total = expected.size();
-        System.out.println("Verifying " + total + " files with " + threads + (threads == 1 ? " thread..." : " threads..."));
+        if (verbosity != Verbosity.QUIET) {
+            System.out.println("Verifying " + total + " files with " + threads + (threads == 1 ? " thread..." : " threads..."));
+        }
 
         String[] entries = expected.keySet().toArray(new String[0]);
-        // result[i]: "OK", "MISSING", or "MISMATCH"
         String[] result = new String[total];
-        AtomicInteger done = new AtomicInteger();
+        Progress prog = new Progress(total, verbosity);
         ExecutorService pool = Executors.newFixedThreadPool(threads);
         try {
             List<Future<?>> futures = new ArrayList<>(total);
@@ -283,10 +393,7 @@ public class Main {
                         status = got.equalsIgnoreCase(want) ? "OK" : "MISMATCH";
                     }
                     result[slot] = status;
-                    int n = done.incrementAndGet();
-                    synchronized (System.out) {
-                        System.out.printf("  [%d/%d] %s%n", n, total, rel);
-                    }
+                    prog.tick(rel);
                     return null;
                 }));
             }
@@ -294,40 +401,147 @@ public class Main {
         } finally {
             pool.shutdownNow();
         }
+        Progress.finish(verbosity);
 
-        int ok = 0, mismatched = 0, missing = 0;
-        List<String> problems = new ArrayList<>();
+        VerifyResult r = new VerifyResult();
+        r.expected = expected;
         for (int i = 0; i < total; i++) {
             switch (result[i]) {
-                case "OK"       -> ok++;
-                case "MISMATCH" -> { mismatched++; problems.add("MISMATCH: " + entries[i]); }
-                case "MISSING"  -> { missing++;    problems.add("MISSING : " + entries[i]); }
+                case "OK"       -> r.ok++;
+                case "MISMATCH" -> r.mismatched.add(entries[i]);
+                case "MISSING"  -> r.missing.add(entries[i]);
             }
         }
 
-        // Detect new files that weren't in the db
-        List<Path> present = collectFiles(root);
+        List<Path> present = collectFiles(root, ignores);
         Set<String> expectedKeys = expected.keySet();
-        List<String> extras = new ArrayList<>();
         for (Path p : present) {
             String rel = toRelative(root, p);
-            if (!expectedKeys.contains(rel)) extras.add(rel);
+            if (!expectedKeys.contains(rel)) r.extras.add(rel);
         }
+        return r;
+    }
 
+    private static void printVerifyReport(VerifyResult r) {
         System.out.println();
         System.out.println("=== Verification report ===");
-        System.out.println("OK         : " + ok);
-        System.out.println("Mismatched : " + mismatched);
-        System.out.println("Missing    : " + missing);
-        System.out.println("New/Extra  : " + extras.size());
-        for (String s : problems) System.out.println("  " + s);
-        for (String s : extras)   System.out.println("  NEW     : " + s);
+        System.out.println("OK         : " + r.ok);
+        System.out.println("Mismatched : " + r.mismatched.size());
+        System.out.println("Missing    : " + r.missing.size());
+        System.out.println("New/Extra  : " + r.extras.size());
+        for (String s : r.mismatched) System.out.println("  MISMATCH: " + s);
+        for (String s : r.missing)    System.out.println("  MISSING : " + s);
+        for (String s : r.extras)     System.out.println("  NEW     : " + s);
+    }
 
-        if (mismatched == 0 && missing == 0) {
+    private static void verify(Path root, Path db, int threads, List<String> ignores, Verbosity verbosity) throws Exception {
+        VerifyResult r = runVerify(root, db, threads, ignores, verbosity);
+        printVerifyReport(r);
+        if (r.mismatched.isEmpty() && r.missing.isEmpty()) {
             System.out.println("All files intact.");
         } else {
             System.out.println("Integrity check FAILED.");
+            System.exit(1);
         }
+    }
+
+    private static void update(Path root, Path db, int threads, List<String> ignores, Verbosity verbosity, BufferedReader in) throws Exception {
+        VerifyResult r = runVerify(root, db, threads, ignores, verbosity);
+        printVerifyReport(r);
+
+        if (!r.mismatched.isEmpty()) {
+            System.out.println();
+            System.out.println("Mismatched files will NOT be updated automatically — that's potential corruption.");
+            System.out.println("Resolve them manually (restore from backup, or use [r] rehash) before updating.");
+        }
+
+        if (r.missing.isEmpty() && r.extras.isEmpty()) {
+            System.out.println();
+            System.out.println("Manifest is already in sync. Nothing to update.");
+            return;
+        }
+
+        boolean removeMissing = false;
+        boolean addExtras = false;
+
+        if (!r.missing.isEmpty()) {
+            System.out.println();
+            removeMissing = confirm(in, "Remove " + r.missing.size() + " missing entries from the manifest? [y/N]: ");
+        }
+        if (!r.extras.isEmpty()) {
+            System.out.println();
+            addExtras = confirm(in, "Hash and add " + r.extras.size() + " new files to the manifest? [y/N]: ");
+        }
+
+        if (!removeMissing && !addExtras) {
+            System.out.println("No changes applied.");
+            return;
+        }
+
+        LinkedHashMap<String, String> updated = new LinkedHashMap<>(r.expected);
+        if (removeMissing) for (String m : r.missing) updated.remove(m);
+
+        if (addExtras) {
+            int total = r.extras.size();
+            if (verbosity != Verbosity.QUIET) {
+                System.out.println("Hashing " + total + " new files with " + threads + (threads == 1 ? " thread..." : " threads..."));
+            }
+            String[] digests = new String[total];
+            Progress prog = new Progress(total, verbosity);
+            ExecutorService pool = Executors.newFixedThreadPool(threads);
+            try {
+                List<Future<?>> futures = new ArrayList<>(total);
+                for (int idx = 0; idx < total; idx++) {
+                    final int slot = idx;
+                    final String rel = r.extras.get(idx);
+                    futures.add(pool.submit(() -> {
+                        digests[slot] = sha256(root.resolve(rel));
+                        prog.tick(rel);
+                        return null;
+                    }));
+                }
+                awaitAll(futures);
+            } finally {
+                pool.shutdownNow();
+            }
+            Progress.finish(verbosity);
+            for (int i = 0; i < total; i++) updated.put(r.extras.get(i), digests[i]);
+        }
+
+        Path backup = backupDb(db);
+        System.out.println("Backed up existing manifest to " + backup.getFileName());
+        writeManifestAtomic(db, updated);
+        System.out.println("Wrote " + updated.size() + " hashes to " + db.getFileName()
+                + " (added " + (addExtras ? r.extras.size() : 0)
+                + ", removed " + (removeMissing ? r.missing.size() : 0) + ").");
+    }
+
+    private static void diffManifests(Path a, Path b) throws IOException {
+        if (!Files.exists(a)) { System.err.println("Not found: " + a); System.exit(2); }
+        if (!Files.exists(b)) { System.err.println("Not found: " + b); System.exit(2); }
+        Map<String, String> ma = loadManifest(a);
+        Map<String, String> mb = loadManifest(b);
+        List<String> added = new ArrayList<>();
+        List<String> removed = new ArrayList<>();
+        List<String> changed = new ArrayList<>();
+        for (Map.Entry<String, String> e : mb.entrySet()) {
+            String prev = ma.get(e.getKey());
+            if (prev == null) added.add(e.getKey());
+            else if (!prev.equalsIgnoreCase(e.getValue())) changed.add(e.getKey());
+        }
+        for (String k : ma.keySet()) if (!mb.containsKey(k)) removed.add(k);
+        Collections.sort(added);
+        Collections.sort(removed);
+        Collections.sort(changed);
+
+        System.out.println("Diff: " + a + " -> " + b);
+        System.out.println("Added   : " + added.size());
+        System.out.println("Removed : " + removed.size());
+        System.out.println("Changed : " + changed.size());
+        for (String s : added)   System.out.println("  + " + s);
+        for (String s : removed) System.out.println("  - " + s);
+        for (String s : changed) System.out.println("  ~ " + s);
+        if (!added.isEmpty() || !removed.isEmpty() || !changed.isEmpty()) System.exit(1);
     }
 
     private static void awaitAll(List<Future<?>> futures) throws Exception {
@@ -346,15 +560,47 @@ public class Main {
         }
     }
 
-    private static List<Path> collectFiles(Path root) throws IOException {
+    private static List<Path> collectFiles(Path root, List<String> ignores) throws IOException {
         List<Path> out = new ArrayList<>();
         try (Stream<Path> s = Files.walk(root)) {
             s.filter(Files::isRegularFile)
              .filter(p -> !isManifestFile(root, p))
+             .filter(p -> !isIgnored(toRelative(root, p), ignores))
              .sorted()
              .forEach(out::add);
         }
         return out;
+    }
+
+    private static List<String> normalizeIgnores(List<String> raw) {
+        List<String> out = new ArrayList<>();
+        for (String entry : raw) {
+            String e = entry.trim();
+            if (e.isEmpty()) continue;
+            e = e.replace('\\', '/');
+            boolean dir = e.endsWith("/");
+            while (e.startsWith("./")) e = e.substring(2);
+            while (e.startsWith("/")) e = e.substring(1);
+            while (e.endsWith("/")) e = e.substring(0, e.length() - 1);
+            if (e.isEmpty()) continue;
+            out.add(dir ? e + "/" : e);
+        }
+        return out;
+    }
+
+    private static boolean isIgnored(String rel, List<String> ignores) {
+        if (ignores == null || ignores.isEmpty()) return false;
+        for (String ig : ignores) {
+            if (ig.endsWith("/")) {
+                String prefix = ig; // already has trailing /
+                if (rel.equals(prefix.substring(0, prefix.length() - 1))) return true;
+                if (rel.startsWith(prefix)) return true;
+            } else {
+                if (rel.equals(ig)) return true;
+                if (rel.startsWith(ig + "/")) return true;
+            }
+        }
+        return false;
     }
 
     private static boolean isManifestFile(Path root, Path p) {
