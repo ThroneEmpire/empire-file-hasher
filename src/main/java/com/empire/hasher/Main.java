@@ -157,7 +157,7 @@ public class Main {
                 String choice = in.readLine();
                 if (choice == null) return;
                 switch (choice.trim().toLowerCase(Locale.ROOT)) {
-                    case "v" -> verify(root, db, threads, normalizedIgnores, verbosity);
+                    case "v" -> verify(root, db, threads, normalizedIgnores, verbosity, in);
                     case "u" -> update(root, db, threads, normalizedIgnores, verbosity, in);
                     case "r" -> {
                         System.out.println();
@@ -422,32 +422,103 @@ public class Main {
         return r;
     }
 
-    private static void printVerifyReport(VerifyResult r) {
+    private static void printSummary(VerifyResult r) {
+        boolean failed = !r.mismatched.isEmpty() || !r.missing.isEmpty();
         System.out.println();
-        System.out.println("=== Verification report ===");
-        System.out.println("OK         : " + r.ok);
-        System.out.println("Mismatched : " + r.mismatched.size());
-        System.out.println("Missing    : " + r.missing.size());
-        System.out.println("New/Extra  : " + r.extras.size());
-        for (String s : r.mismatched) System.out.println("  MISMATCH: " + s);
-        for (String s : r.missing)    System.out.println("  MISSING : " + s);
-        for (String s : r.extras)     System.out.println("  NEW     : " + s);
+        System.out.println("=== Summary ===");
+        System.out.println("  OK         : " + r.ok);
+        System.out.println("  Mismatched : " + r.mismatched.size());
+        System.out.println("  Missing    : " + r.missing.size());
+        System.out.println("  New/Extra  : " + r.extras.size());
+        System.out.println();
+        if (failed) {
+            System.out.println("Status: INTEGRITY CHECK FAILED");
+            if (!r.mismatched.isEmpty()) {
+                System.out.println("  - " + r.mismatched.size()
+                        + " file(s) MISMATCH — bytes differ from the recorded hash (possible corruption).");
+            }
+            if (!r.missing.isEmpty()) {
+                System.out.println("  - " + r.missing.size()
+                        + " file(s) MISSING — listed in manifest but not found on disk.");
+            }
+            if (!r.extras.isEmpty()) {
+                System.out.println("  Note: " + r.extras.size()
+                        + " NEW file(s) on disk are NOT a failure — use [u] update to add them to the manifest.");
+            }
+        } else {
+            System.out.println("Status: All files intact.");
+            if (!r.extras.isEmpty()) {
+                System.out.println("  Note: " + r.extras.size()
+                        + " NEW file(s) on disk are not in the manifest — use [u] update to add them.");
+            }
+        }
     }
 
-    private static void verify(Path root, Path db, int threads, List<String> ignores, Verbosity verbosity) throws Exception {
+    private static void verify(Path root, Path db, int threads, List<String> ignores, Verbosity verbosity, BufferedReader in) throws Exception {
         VerifyResult r = runVerify(root, db, threads, ignores, verbosity);
-        printVerifyReport(r);
-        if (r.mismatched.isEmpty() && r.missing.isEmpty()) {
-            System.out.println("All files intact.");
-        } else {
-            System.out.println("Integrity check FAILED.");
+        printSummary(r);
+        drillVerify(in, r, verbosity);
+        if (!r.mismatched.isEmpty() || !r.missing.isEmpty()) {
             System.exit(1);
+        }
+    }
+
+    private static void drillVerify(BufferedReader in, VerifyResult r, Verbosity v) throws IOException {
+        if (v == Verbosity.QUIET) return;
+        if (r.mismatched.isEmpty() && r.missing.isEmpty() && r.extras.isEmpty()) return;
+        while (true) {
+            System.out.println();
+            System.out.println("View details?");
+            System.out.println("  [1] Show MISMATCH entries (" + r.mismatched.size() + ")");
+            System.out.println("  [2] Show MISSING entries  (" + r.missing.size() + ")");
+            System.out.println("  [3] Show NEW entries      (" + r.extras.size() + ")");
+            System.out.println("  [q] done");
+            System.out.print("Choice: ");
+            String line = in.readLine();
+            if (line == null) return;
+            String c = line.trim().toLowerCase(Locale.ROOT);
+            if (c.equals("q") || c.isEmpty()) return;
+            switch (c) {
+                case "1" -> dumpList("MISMATCH", r.mismatched);
+                case "2" -> dumpList("MISSING ", r.missing);
+                case "3" -> dumpList("NEW     ", r.extras);
+                default  -> System.out.println("Unknown choice: " + line);
+            }
+        }
+    }
+
+    private static void dumpList(String label, List<String> items) {
+        if (items.isEmpty()) { System.out.println("(none)"); return; }
+        for (String s : items) System.out.println("  " + label + ": " + s);
+    }
+
+    private static void drillUpdate(BufferedReader in, Verbosity v, List<String> added, List<String> removed, List<String> mismatched) throws IOException {
+        if (v == Verbosity.QUIET) return;
+        if (added.isEmpty() && removed.isEmpty() && mismatched.isEmpty()) return;
+        while (true) {
+            System.out.println();
+            System.out.println("View details?");
+            System.out.println("  [1] Show ADDED entries      (" + added.size() + ")");
+            System.out.println("  [2] Show REMOVED entries    (" + removed.size() + ")");
+            System.out.println("  [3] Show MISMATCH entries   (" + mismatched.size() + ") — left untouched");
+            System.out.println("  [q] done");
+            System.out.print("Choice: ");
+            String line = in.readLine();
+            if (line == null) return;
+            String c = line.trim().toLowerCase(Locale.ROOT);
+            if (c.equals("q") || c.isEmpty()) return;
+            switch (c) {
+                case "1" -> dumpList("ADDED   ", added);
+                case "2" -> dumpList("REMOVED ", removed);
+                case "3" -> dumpList("MISMATCH", mismatched);
+                default  -> System.out.println("Unknown choice: " + line);
+            }
         }
     }
 
     private static void update(Path root, Path db, int threads, List<String> ignores, Verbosity verbosity, BufferedReader in) throws Exception {
         VerifyResult r = runVerify(root, db, threads, ignores, verbosity);
-        printVerifyReport(r);
+        printSummary(r);
 
         if (!r.mismatched.isEmpty()) {
             System.out.println();
@@ -511,9 +582,26 @@ public class Main {
         Path backup = backupDb(db);
         System.out.println("Backed up existing manifest to " + backup.getFileName());
         writeManifestAtomic(db, updated);
-        System.out.println("Wrote " + updated.size() + " hashes to " + db.getFileName()
-                + " (added " + (addExtras ? r.extras.size() : 0)
-                + ", removed " + (removeMissing ? r.missing.size() : 0) + ").");
+
+        int added = addExtras ? r.extras.size() : 0;
+        int removed = removeMissing ? r.missing.size() : 0;
+        System.out.println();
+        System.out.println("=== Update summary ===");
+        System.out.println("  Added       : " + added + " new file(s) hashed and recorded");
+        System.out.println("  Removed     : " + removed + " missing entry/entries dropped from manifest");
+        System.out.println("  Unchanged   : " + r.ok + " file(s) already matched");
+        System.out.println("  Mismatched  : " + r.mismatched.size() + " file(s) left untouched (possible corruption)");
+        System.out.println("  Total in db : " + updated.size());
+        System.out.println("  Backup      : " + backup.getFileName());
+        if (!r.mismatched.isEmpty()) {
+            System.out.println();
+            System.out.println("WARNING: " + r.mismatched.size()
+                    + " mismatched file(s) were NOT updated. Investigate before trusting the manifest.");
+        }
+
+        List<String> addedList = addExtras ? r.extras : Collections.emptyList();
+        List<String> removedList = removeMissing ? r.missing : Collections.emptyList();
+        drillUpdate(in, verbosity, addedList, removedList, r.mismatched);
     }
 
     private static void diffManifests(Path a, Path b) throws IOException {

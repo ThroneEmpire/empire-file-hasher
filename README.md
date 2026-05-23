@@ -105,19 +105,40 @@ hashes.db exists.
   [q] quit
 Choice: v
 ...
-=== Verification report ===
-OK         : 3
-Mismatched : 0
-Missing    : 0
-New/Extra  : 0
-All files intact.
+=== Summary ===
+  OK         : 1234
+  Mismatched : 2
+  Missing    : 1
+  New/Extra  : 47
+
+Status: INTEGRITY CHECK FAILED
+  - 2 file(s) MISMATCH — bytes differ from the recorded hash (possible corruption).
+  - 1 file(s) MISSING — listed in manifest but not found on disk.
+  Note: 47 NEW file(s) on disk are NOT a failure — use [u] update to add them to the manifest.
+
+View details?
+  [1] Show MISMATCH entries (2)
+  [2] Show MISSING entries  (1)
+  [3] Show NEW entries      (47)
+  [q] done
+Choice:
 ```
 
-The report flags four states per file:
+The report classifies every path into four states:
 - **OK** — file present, hash matches.
 - **MISMATCH** — file present, bytes changed since the manifest was written.
 - **MISSING** — file listed in manifest but not found on disk.
 - **NEW** — file on disk that wasn't in the manifest (added after hashing).
+
+Only **MISMATCH** and **MISSING** cause an integrity failure (exit `1`).
+**NEW** files are reported but do not fail the check — they're new content
+the manifest hasn't been told about yet. Use update mode to add them.
+
+The drill menu after the summary lets you inspect each category on
+demand, so you don't have to scroll through thousands of NEW lines just
+to find out what failed. Press `q` (or Enter) when done. The menu is
+skipped entirely in `--quiet` mode and exits cleanly if stdin is closed
+(safe for cron / piped invocations).
 
 ### Interrupting a long run
 
@@ -204,6 +225,11 @@ intend to declare the current bytes the new truth.
 
 The previous manifest is backed up to `hashes.db.bak` (timestamped if a
 backup already exists) before the new one is written.
+
+After the write, update prints an `=== Update summary ===` block (added
+/ removed / unchanged / mismatched counts + backup filename) followed by
+the same drill menu as verify — `[1]` ADDED, `[2]` REMOVED, `[3]`
+MISMATCH — so you can confirm exactly which paths were touched.
 
 ### Diffing manifests
 
