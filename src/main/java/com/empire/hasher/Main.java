@@ -649,11 +649,12 @@ public class Main {
     }
 
     private static List<Path> collectFiles(Path root, List<String> ignores) throws IOException {
+        List<PathMatcher> matchers = compileIgnoreMatchers(ignores);
         List<Path> out = new ArrayList<>();
         try (Stream<Path> s = Files.walk(root)) {
             s.filter(Files::isRegularFile)
              .filter(p -> !isManifestFile(root, p))
-             .filter(p -> !isIgnored(toRelative(root, p), ignores))
+             .filter(p -> !isIgnored(toRelative(root, p), matchers))
              .sorted()
              .forEach(out::add);
         }
@@ -676,17 +677,23 @@ public class Main {
         return out;
     }
 
-    private static boolean isIgnored(String rel, List<String> ignores) {
-        if (ignores == null || ignores.isEmpty()) return false;
-        for (String ig : ignores) {
-            if (ig.endsWith("/")) {
-                String prefix = ig; // already has trailing /
-                if (rel.equals(prefix.substring(0, prefix.length() - 1))) return true;
-                if (rel.startsWith(prefix)) return true;
-            } else {
-                if (rel.equals(ig)) return true;
-                if (rel.startsWith(ig + "/")) return true;
-            }
+    private static List<PathMatcher> compileIgnoreMatchers(List<String> normalized) {
+        List<PathMatcher> out = new ArrayList<>();
+        FileSystem fs = FileSystems.getDefault();
+        for (String ig : normalized) {
+            boolean dir = ig.endsWith("/");
+            String base = dir ? ig.substring(0, ig.length() - 1) : ig;
+            out.add(fs.getPathMatcher("glob:" + base));
+            if (dir) out.add(fs.getPathMatcher("glob:" + base + "/**"));
+        }
+        return out;
+    }
+
+    private static boolean isIgnored(String rel, List<PathMatcher> matchers) {
+        if (matchers == null || matchers.isEmpty()) return false;
+        Path p = Paths.get(rel);
+        for (PathMatcher m : matchers) {
+            if (m.matches(p)) return true;
         }
         return false;
     }

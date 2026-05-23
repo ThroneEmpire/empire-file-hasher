@@ -13,8 +13,13 @@ failing drive. If a byte flips, this will tell you.
   everything under the current directory and writes `hashes.db`.
 - **Later runs** (manifest exists): prompts you to
   - `v` — verify every file in the manifest against its stored hash,
+  - `u` — update: verify, then add new files and drop missing entries,
   - `r` — rehash everything and overwrite the manifest,
   - `q` — quit.
+- **Compare two manifests** with `--diff OLD.db NEW.db` to see what
+  was added, removed, or changed between snapshots — no rehashing needed.
+- **Ignore paths** via `-i/--ignore` or a `.hashignore` file at the root,
+  with full glob support (`**/.hist/`, `*.tmp`, `build-*/`).
 - Walks recursively through any depth of subdirectories. Hashes any file
   type — videos, archives, ISOs, photos, documents, whatever.
 - Streams files in 64 KiB chunks, so terabyte-scale archives are fine.
@@ -180,8 +185,17 @@ verification. Two sources are supported and merged together:
 java -jar empire-file-hasher.jar /path/to/archive \
     --ignore ./build/ \
     --ignore node_modules/ \
+    --ignore "**/.cache/" \
+    --ignore "*.tmp" \
     -i secrets.txt
 ```
+
+**Always quote glob patterns** on the CLI — single (`'**/.cache/'`) or
+double (`"**/.cache/"`) both work. Without quotes, your shell will
+expand the pattern against files in your *current* directory before the
+program ever sees it — not against the archive being hashed. Literal
+paths (no wildcards) don't need quoting. If you're using lots of
+patterns, putting them in `.hashignore` is easier — no shell involved.
 
 **2. `.hashignore` file** at the root of the directory being hashed —
 one entry per line. Blank lines and lines starting with `#` are ignored:
@@ -191,15 +205,26 @@ one entry per line. Blank lines and lines starting with `#` are ignored:
 build/
 node_modules/
 
+# any .cache folder, at any depth in the tree
+**/.cache/
+
+# all .tmp files anywhere
+**/*.tmp
+
 # local-only files
 secrets.txt
 scratch/
 ```
 
-Matching rules (intentionally simple — no globs or wildcards):
-- A trailing `/` means "this directory and everything under it".
-- Without a trailing `/`, the entry matches that exact relative path. If it
-  happens to be a directory, its contents are also ignored.
+Matching uses Java's standard glob syntax:
+- `*` matches any sequence of characters within a single path component.
+- `**` matches across path components (any depth, including zero).
+- `?` matches a single character; `[abc]` and `[a-z]` are character classes.
+- A trailing `/` means "match this directory and everything under it".
+- Without a trailing `/`, the entry matches that exact path (with whatever
+  globs you put in it).
+- Patterns without `**` are anchored to the root — `build/` only matches
+  a top-level `build/`. To match at any depth, use `**/build/`.
 - Leading `./` and `/` are stripped; backslashes are normalized to `/`,
   so Windows-style entries work.
 
