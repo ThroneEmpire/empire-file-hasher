@@ -2,27 +2,26 @@ package com.empire.hasher;
 
 import java.io.BufferedReader;
 import java.io.IOException;
-import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.*;
-import java.security.MessageDigest;
-import java.security.NoSuchAlgorithmException;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReferenceArray;
 import java.util.stream.Stream;
+
+import com.empire.hasher.Util.DiffResult;
+import static com.empire.hasher.Util.*;
 
 public class Main {
 
     // Set once during argument parsing, then read-only for the rest of the run.
-    private static String DB_FILENAME = "hashes.db";
-    private static Path DB_DIR; // directory holding the manifest family
-    private static final String IGNORE_FILENAME = ".hashignore";
-    private static final String PARTIAL_SUFFIX = ".partial";
-    private static final int BUFFER_SIZE = 1 << 16; // 64 KiB
+    // Package-private so tests in the same package can configure them.
+    static String DB_FILENAME = "hashes.db";
+    static Path DB_DIR; // directory holding the manifest family
+    static final String IGNORE_FILENAME = ".hashignore";
+    static final String PARTIAL_SUFFIX = ".partial";
 
     enum Verbosity { QUIET, NORMAL, VERBOSE }
 
@@ -124,11 +123,9 @@ public class Main {
 
         // Resolve the manifest location. A bare name lives in DIR (the common
         // case); a path is resolved relative to the current working directory.
-        Path db;
-        if (dbArg == null) {
-            db = root.resolve(DB_FILENAME);
-        } else if (dbArg.contains("/") || dbArg.contains("\\")) {
-            db = Paths.get(dbArg).toAbsolutePath().normalize();
+        Path db = resolveDbPath(root, dbArg, DB_FILENAME);
+        boolean dbIsPath = dbArg != null && (dbArg.contains("/") || dbArg.contains("\\"));
+        if (dbIsPath) {
             if (Files.isDirectory(db)) {
                 System.err.println("--db points to a directory, not a file: " + db);
                 System.exit(2);
@@ -138,8 +135,6 @@ public class Main {
                 System.err.println("Directory for --db does not exist: " + parent);
                 System.exit(2);
             }
-        } else {
-            db = root.resolve(dbArg);
         }
         // DB_FILENAME / DB_DIR drive the derived family (.partial/.bak/.tmp)
         // and manifest exclusion, wherever the db ends up living.
@@ -237,7 +232,7 @@ public class Main {
         }
     }
 
-    private static Path backupDb(Path db) throws IOException {
+    static Path backupDb(Path db) throws IOException {
         Path parent = db.getParent();
         Path primary = parent.resolve(DB_FILENAME + ".bak");
         if (!Files.exists(primary)) {
@@ -257,7 +252,7 @@ public class Main {
         return line != null && line.trim().equalsIgnoreCase("y");
     }
 
-    private static void hashAll(Path root, Path db, int threads, Map<String, String> prior, List<String> ignores, Verbosity verbosity) throws Exception {
+    static void hashAll(Path root, Path db, int threads, Map<String, String> prior, List<String> ignores, Verbosity verbosity) throws Exception {
         Path partial = db.resolveSibling(DB_FILENAME + PARTIAL_SUFFIX);
         List<Path> allFiles = collectFiles(root, ignores);
 
@@ -384,33 +379,7 @@ public class Main {
         }
     }
 
-    private static Map<String, String> loadManifest(Path p) throws IOException {
-        Map<String, String> out = new LinkedHashMap<>();
-        for (String line : Files.readAllLines(p, StandardCharsets.UTF_8)) {
-            if (line.isBlank()) continue;
-            int sep = line.indexOf("  ");
-            if (sep < 0) continue;
-            out.put(line.substring(sep + 2), line.substring(0, sep));
-        }
-        return out;
-    }
-
-    private static void writeManifestAtomic(Path p, Map<String, String> entries) throws IOException {
-        List<String> keys = new ArrayList<>(entries.keySet());
-        Collections.sort(keys);
-        List<String> lines = new ArrayList<>(keys.size());
-        for (String k : keys) lines.add(entries.get(k) + "  " + k);
-        Path tmp = p.resolveSibling(p.getFileName() + ".tmp");
-        Files.write(tmp, lines, StandardCharsets.UTF_8,
-                StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
-        try {
-            Files.move(tmp, p, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
-        } catch (AtomicMoveNotSupportedException e) {
-            Files.move(tmp, p, StandardCopyOption.REPLACE_EXISTING);
-        }
-    }
-
-    private static class VerifyResult {
+    static class VerifyResult {
         LinkedHashMap<String, String> expected;
         List<String> mismatched = new ArrayList<>();
         List<String> missing = new ArrayList<>();
@@ -418,7 +387,7 @@ public class Main {
         int ok;
     }
 
-    private static VerifyResult runVerify(Path root, Path db, int threads, List<String> ignores, Verbosity verbosity) throws Exception {
+    static VerifyResult runVerify(Path root, Path db, int threads, List<String> ignores, Verbosity verbosity) throws Exception {
         List<String> lines = Files.readAllLines(db, StandardCharsets.UTF_8);
         LinkedHashMap<String, String> expected = new LinkedHashMap<>();
         for (String line : lines) {
@@ -667,29 +636,16 @@ public class Main {
     private static void diffManifests(Path a, Path b) throws IOException {
         if (!Files.exists(a)) { System.err.println("Not found: " + a); System.exit(2); }
         if (!Files.exists(b)) { System.err.println("Not found: " + b); System.exit(2); }
-        Map<String, String> ma = loadManifest(a);
-        Map<String, String> mb = loadManifest(b);
-        List<String> added = new ArrayList<>();
-        List<String> removed = new ArrayList<>();
-        List<String> changed = new ArrayList<>();
-        for (Map.Entry<String, String> e : mb.entrySet()) {
-            String prev = ma.get(e.getKey());
-            if (prev == null) added.add(e.getKey());
-            else if (!prev.equalsIgnoreCase(e.getValue())) changed.add(e.getKey());
-        }
-        for (String k : ma.keySet()) if (!mb.containsKey(k)) removed.add(k);
-        Collections.sort(added);
-        Collections.sort(removed);
-        Collections.sort(changed);
+        DiffResult r = computeDiff(loadManifest(a), loadManifest(b));
 
         System.out.println("Diff: " + a + " -> " + b);
-        System.out.println("Added   : " + added.size());
-        System.out.println("Removed : " + removed.size());
-        System.out.println("Changed : " + changed.size());
-        for (String s : added)   System.out.println("  + " + s);
-        for (String s : removed) System.out.println("  - " + s);
-        for (String s : changed) System.out.println("  ~ " + s);
-        if (!added.isEmpty() || !removed.isEmpty() || !changed.isEmpty()) System.exit(1);
+        System.out.println("Added   : " + r.added.size());
+        System.out.println("Removed : " + r.removed.size());
+        System.out.println("Changed : " + r.changed.size());
+        for (String s : r.added)   System.out.println("  + " + s);
+        for (String s : r.removed) System.out.println("  - " + s);
+        for (String s : r.changed) System.out.println("  ~ " + s);
+        if (!r.isEmpty()) System.exit(1);
     }
 
     private static void awaitAll(List<Future<?>> futures) throws Exception {
@@ -708,12 +664,12 @@ public class Main {
         }
     }
 
-    private static List<Path> collectFiles(Path root, List<String> ignores) throws IOException {
+    static List<Path> collectFiles(Path root, List<String> ignores) throws IOException {
         List<PathMatcher> matchers = compileIgnoreMatchers(ignores);
         List<Path> out = new ArrayList<>();
         try (Stream<Path> s = Files.walk(root)) {
             s.filter(Files::isRegularFile)
-             .filter(p -> !isManifestFile(root, p))
+             .filter(p -> !isManifestFile(DB_DIR, DB_FILENAME, PARTIAL_SUFFIX, p))
              .filter(p -> !isIgnored(toRelative(root, p), matchers))
              .sorted()
              .forEach(out::add);
@@ -721,69 +677,4 @@ public class Main {
         return out;
     }
 
-    private static List<String> normalizeIgnores(List<String> raw) {
-        List<String> out = new ArrayList<>();
-        for (String entry : raw) {
-            String e = entry.trim();
-            if (e.isEmpty()) continue;
-            e = e.replace('\\', '/');
-            boolean dir = e.endsWith("/");
-            while (e.startsWith("./")) e = e.substring(2);
-            while (e.startsWith("/")) e = e.substring(1);
-            while (e.endsWith("/")) e = e.substring(0, e.length() - 1);
-            if (e.isEmpty()) continue;
-            out.add(dir ? e + "/" : e);
-        }
-        return out;
-    }
-
-    private static List<PathMatcher> compileIgnoreMatchers(List<String> normalized) {
-        List<PathMatcher> out = new ArrayList<>();
-        FileSystem fs = FileSystems.getDefault();
-        for (String ig : normalized) {
-            boolean dir = ig.endsWith("/");
-            String base = dir ? ig.substring(0, ig.length() - 1) : ig;
-            out.add(fs.getPathMatcher("glob:" + base));
-            if (dir) out.add(fs.getPathMatcher("glob:" + base + "/**"));
-        }
-        return out;
-    }
-
-    private static boolean isIgnored(String rel, List<PathMatcher> matchers) {
-        if (matchers == null || matchers.isEmpty()) return false;
-        Path p = Paths.get(rel);
-        for (PathMatcher m : matchers) {
-            if (m.matches(p)) return true;
-        }
-        return false;
-    }
-
-    private static boolean isManifestFile(Path root, Path p) {
-        // The manifest family lives next to the db (DB_DIR), which may be the
-        // root or a subdirectory of it. Only exclude files in that directory.
-        Path parent = p.getParent();
-        if (parent == null || DB_DIR == null || !parent.equals(DB_DIR)) return false;
-        String name = p.getFileName().toString();
-        return name.equals(DB_FILENAME)
-                || name.startsWith(DB_FILENAME + ".bak")
-                || name.equals(DB_FILENAME + PARTIAL_SUFFIX)
-                || name.equals(DB_FILENAME + ".tmp");
-    }
-
-    private static String toRelative(Path root, Path p) {
-        return root.relativize(p).toString().replace('\\', '/');
-    }
-
-    private static String sha256(Path p) throws IOException, NoSuchAlgorithmException {
-        MessageDigest md = MessageDigest.getInstance("SHA-256");
-        try (InputStream is = Files.newInputStream(p)) {
-            byte[] buf = new byte[BUFFER_SIZE];
-            int n;
-            while ((n = is.read(buf)) > 0) md.update(buf, 0, n);
-        }
-        byte[] digest = md.digest();
-        StringBuilder sb = new StringBuilder(digest.length * 2);
-        for (byte b : digest) sb.append(String.format("%02x", b));
-        return sb.toString();
-    }
 }

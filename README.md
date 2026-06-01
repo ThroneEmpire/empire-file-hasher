@@ -33,7 +33,7 @@ failing drive. If a byte flips, this will tell you.
 ## Requirements
 
 - Java 21 or newer on `PATH`.
-- No external dependencies — just the JDK.
+- No runtime dependencies — just the JDK. (JUnit is pulled in for tests only.)
 
 ## Build
 
@@ -46,6 +46,17 @@ This produces a runnable jar at:
 ```
 build/libs/empire-file-hasher.jar
 ```
+
+## Tests
+
+```
+./gradlew test
+```
+
+The pure helper functions live in `Util` (hashing, manifest I/O, ignore-glob
+matching, manifest diffing, db-path resolution) and are unit-tested in
+`UtilTest`. `CollectFilesTest` covers the filesystem walk in `Main.collectFiles`
+— manifest-family exclusion and glob ignores against a temp directory.
 
 ## Usage
 
