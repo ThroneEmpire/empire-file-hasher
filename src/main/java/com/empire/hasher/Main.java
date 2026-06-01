@@ -17,7 +17,9 @@ import java.util.stream.Stream;
 
 public class Main {
 
-    private static final String DB_FILENAME = "hashes.db";
+    // Set once during argument parsing, then read-only for the rest of the run.
+    private static String DB_FILENAME = "hashes.db";
+    private static Path DB_DIR; // directory holding the manifest family
     private static final String IGNORE_FILENAME = ".hashignore";
     private static final String PARTIAL_SUFFIX = ".partial";
     private static final int BUFFER_SIZE = 1 << 16; // 64 KiB
@@ -30,6 +32,8 @@ public class Main {
         List<String> ignoreArgs = new ArrayList<>();
         Verbosity verbosity = Verbosity.NORMAL;
         String diffA = null, diffB = null;
+        String dbArg = null;
+        String ignoreFileArg = null;
         for (int i = 0; i < args.length; i++) {
             String a = args[i];
             if (a.equals("--diff")) {
@@ -64,14 +68,37 @@ public class Main {
                     System.exit(2);
                 }
                 ignoreArgs.add(args[++i]);
+            } else if (a.equals("-d") || a.equals("--db")) {
+                if (i + 1 >= args.length) {
+                    System.err.println("Missing value for " + a);
+                    System.exit(2);
+                }
+                dbArg = args[++i].trim();
+                if (dbArg.isEmpty()) {
+                    System.err.println("Database name must not be empty.");
+                    System.exit(2);
+                }
+            } else if (a.equals("--ignore-file")) {
+                if (i + 1 >= args.length) {
+                    System.err.println("Missing value for " + a);
+                    System.exit(2);
+                }
+                ignoreFileArg = args[++i].trim();
+                if (ignoreFileArg.isEmpty()) {
+                    System.err.println("Ignore-file path must not be empty.");
+                    System.exit(2);
+                }
             } else if (a.equals("-h") || a.equals("--help")) {
                 System.out.println("Usage: empire-file-hasher [DIR] [options]");
                 System.out.println("       empire-file-hasher --diff OLD.db NEW.db");
                 System.out.println();
                 System.out.println("  DIR              directory to hash (default: current directory)");
+                System.out.println("  -d, --db NAME    manifest location (default: hashes.db in DIR).");
+                System.out.println("                   A bare name lives in DIR; a path (e.g. ./config/my.db)");
+                System.out.println("                   is resolved relative to the current directory.");
                 System.out.println("  -t, --threads    number of hashing threads (default: 1)");
                 System.out.println("  -i, --ignore     path to ignore (repeatable). Trailing / matches a directory subtree.");
-                System.out.println("                   Also reads patterns from .hashignore at the root if present.");
+                System.out.println("  --ignore-file F  read ignore patterns from F (default: .hashignore in DIR).");
                 System.out.println("  -q, --quiet      suppress per-file output and progress");
                 System.out.println("  -v, --verbose    print every file as it is processed (default: progress line only)");
                 System.out.println("  --diff           compare two manifest files and print differences");
@@ -94,10 +121,43 @@ public class Main {
             System.err.println("Not a directory: " + root);
             System.exit(2);
         }
-        Path db = root.resolve(DB_FILENAME);
+
+        // Resolve the manifest location. A bare name lives in DIR (the common
+        // case); a path is resolved relative to the current working directory.
+        Path db;
+        if (dbArg == null) {
+            db = root.resolve(DB_FILENAME);
+        } else if (dbArg.contains("/") || dbArg.contains("\\")) {
+            db = Paths.get(dbArg).toAbsolutePath().normalize();
+            if (Files.isDirectory(db)) {
+                System.err.println("--db points to a directory, not a file: " + db);
+                System.exit(2);
+            }
+            Path parent = db.getParent();
+            if (parent != null && !Files.isDirectory(parent)) {
+                System.err.println("Directory for --db does not exist: " + parent);
+                System.exit(2);
+            }
+        } else {
+            db = root.resolve(dbArg);
+        }
+        // DB_FILENAME / DB_DIR drive the derived family (.partial/.bak/.tmp)
+        // and manifest exclusion, wherever the db ends up living.
+        DB_FILENAME = db.getFileName().toString();
+        DB_DIR = db.getParent();
 
         List<String> ignores = new ArrayList<>();
-        Path ignoreFile = root.resolve(IGNORE_FILENAME);
+        Path ignoreFile;
+        boolean ignoreFileExplicit = ignoreFileArg != null;
+        if (ignoreFileExplicit) {
+            ignoreFile = Paths.get(ignoreFileArg).toAbsolutePath().normalize();
+            if (!Files.exists(ignoreFile)) {
+                System.err.println("--ignore-file not found: " + ignoreFile);
+                System.exit(2);
+            }
+        } else {
+            ignoreFile = root.resolve(IGNORE_FILENAME);
+        }
         if (Files.exists(ignoreFile)) {
             for (String line : Files.readAllLines(ignoreFile, StandardCharsets.UTF_8)) {
                 String t = line.trim();
@@ -119,7 +179,7 @@ public class Main {
         System.out.println();
 
         try (BufferedReader in = new BufferedReader(new InputStreamReader(System.in, StandardCharsets.UTF_8))) {
-            Path partial = root.resolve(DB_FILENAME + PARTIAL_SUFFIX);
+            Path partial = db.resolveSibling(DB_FILENAME + PARTIAL_SUFFIX);
             if (Files.exists(partial)) {
                 Map<String, String> prior = loadManifest(partial);
                 System.out.println("Found a partial hash from a previous interrupted run: "
@@ -141,17 +201,17 @@ public class Main {
             }
 
             if (!Files.exists(db)) {
-                System.out.println("No hashes.db found in this directory.");
+                System.out.println("No " + DB_FILENAME + " found in this directory.");
                 if (confirm(in, "Do you want to hash every file here (recursively) and create one? [y/N]: ")) {
                     hashAll(root, db, threads, null, normalizedIgnores, verbosity);
                 } else {
                     System.out.println("Nothing to do. Exiting.");
                 }
             } else {
-                System.out.println("hashes.db exists.");
-                System.out.println("  [v] verify existing files against hashes.db");
+                System.out.println(DB_FILENAME + " exists.");
+                System.out.println("  [v] verify existing files against " + DB_FILENAME);
                 System.out.println("  [u] update — verify, then add new files and drop missing entries");
-                System.out.println("  [r] rehash everything and overwrite hashes.db");
+                System.out.println("  [r] rehash everything and overwrite " + DB_FILENAME);
                 System.out.println("  [q] quit");
                 System.out.print("Choice: ");
                 String choice = in.readLine();
@@ -161,7 +221,7 @@ public class Main {
                     case "u" -> update(root, db, threads, normalizedIgnores, verbosity, in);
                     case "r" -> {
                         System.out.println();
-                        System.out.println("WARNING: rehashing will overwrite the existing hashes.db.");
+                        System.out.println("WARNING: rehashing will overwrite the existing " + DB_FILENAME + ".");
                         System.out.println("The old manifest will be backed up before the new one is written.");
                         if (confirm(in, "Are you sure you want to rehash everything? [y/N]: ")) {
                             Path backup = backupDb(db);
@@ -198,7 +258,7 @@ public class Main {
     }
 
     private static void hashAll(Path root, Path db, int threads, Map<String, String> prior, List<String> ignores, Verbosity verbosity) throws Exception {
-        Path partial = root.resolve(DB_FILENAME + PARTIAL_SUFFIX);
+        Path partial = db.resolveSibling(DB_FILENAME + PARTIAL_SUFFIX);
         List<Path> allFiles = collectFiles(root, ignores);
 
         // If resuming, drop any prior entries whose files no longer exist on disk.
@@ -699,11 +759,15 @@ public class Main {
     }
 
     private static boolean isManifestFile(Path root, Path p) {
-        if (!p.getParent().equals(root)) return false;
+        // The manifest family lives next to the db (DB_DIR), which may be the
+        // root or a subdirectory of it. Only exclude files in that directory.
+        Path parent = p.getParent();
+        if (parent == null || DB_DIR == null || !parent.equals(DB_DIR)) return false;
         String name = p.getFileName().toString();
         return name.equals(DB_FILENAME)
                 || name.startsWith(DB_FILENAME + ".bak")
-                || name.equals(DB_FILENAME + PARTIAL_SUFFIX);
+                || name.equals(DB_FILENAME + PARTIAL_SUFFIX)
+                || name.equals(DB_FILENAME + ".tmp");
     }
 
     private static String toRelative(Path root, Path p) {

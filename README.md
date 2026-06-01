@@ -55,6 +55,12 @@ empire-file-hasher --diff OLD.db NEW.db
 ```
 
 - `DIR` — directory to hash. Defaults to the current working directory.
+- `-d NAME` / `--db NAME` — where to keep the manifest. Defaults to
+  `hashes.db` inside `DIR`. A **bare name** (`mydb.db`) lives in `DIR`; a
+  **path** (`./config/mydb.db` or absolute) is resolved relative to your
+  current working directory, so the manifest can live outside the hashed
+  tree entirely. Use this when a directory needs more than one manifest,
+  or when `hashes.db` is already taken. See [Custom manifest name](#custom-manifest-name).
 - `-t N` / `--threads N` — number of hashing threads. Defaults to `1`.
   Increase for fast storage (NVMe / SSD) to overlap I/O with hashing.
   Leave at `1` for spinning disks or network mounts, where seek contention
@@ -62,6 +68,9 @@ empire-file-hasher --diff OLD.db NEW.db
 - `-i PATH` / `--ignore PATH` — skip a path. Repeatable. A trailing `/`
   matches a directory subtree; otherwise the entry matches that exact file
   or directory. See [Ignoring files](#ignoring-files) below.
+- `--ignore-file F` — read ignore patterns from `F` instead of the default
+  `DIR/.hashignore`. Resolved relative to your current working directory.
+  If you point at a file that doesn't exist, that's an error.
 - `-q` / `--quiet` — suppress per-file output and the progress line.
   Final report still prints. Combine with the `update` mode's exit code
   for cron / CI use.
@@ -197,8 +206,9 @@ program ever sees it — not against the archive being hashed. Literal
 paths (no wildcards) don't need quoting. If you're using lots of
 patterns, putting them in `.hashignore` is easier — no shell involved.
 
-**2. `.hashignore` file** at the root of the directory being hashed —
-one entry per line. Blank lines and lines starting with `#` are ignored:
+**2. `.hashignore` file** at the root of the directory being hashed (or a
+file of your choice via `--ignore-file PATH`) — one entry per line. Blank
+lines and lines starting with `#` are ignored:
 
 ```
 # build artifacts
@@ -231,6 +241,11 @@ Matching uses Java's standard glob syntax:
 Ignores apply to fresh hashing and to verification's "new/extra" detection.
 Entries already recorded in `hashes.db` are still verified against disk —
 if you want them dropped, rehash after adding the ignore.
+
+Patterns from `.hashignore` (or `--ignore-file`) and any `--ignore` flags
+are merged together — you can use both at once. A custom `--ignore-file`
+is read relative to your current working directory and must exist; the
+default `DIR/.hashignore` is simply skipped if absent.
 
 ### Update mode
 
@@ -279,6 +294,72 @@ Changed : 1
 
 `+` added in the new manifest, `-` removed, `~` same path but different
 hash. Exits `1` if any differences exist (handy for cron alerts).
+
+### Custom manifest name
+
+By default the manifest is `hashes.db`. Pass `-d` / `--db` to use a
+different name inside the same directory:
+
+```
+empire-file-hasher /path/to/archive --db photos.db
+```
+
+This is useful when:
+- a directory needs more than one independent manifest (e.g. one per
+  subset of files), or
+- the name `hashes.db` is already taken by an unrelated file (for example
+  a manifest that belongs to a *different* directory but happens to live
+  here).
+
+The custom name drives the whole manifest family consistently:
+`photos.db`, `photos.db.partial` (interrupted run), `photos.db.bak*`
+(backups), and `photos.db.tmp` (atomic write staging). The whole family
+lives **next to the db**, and only files in that family (in that location)
+are auto-excluded from hashing.
+
+#### Putting the manifest in another folder
+
+`--db` also accepts a path, letting the manifest live outside the hashed
+tree (handy for keeping `.db` files together, or out of the data set):
+
+```
+# manifest at ./config/photos.db (relative to where you run the command)
+empire-file-hasher /path/to/archive --db ./config/photos.db
+
+# or an absolute path
+empire-file-hasher /path/to/archive --db /var/manifests/photos.db
+```
+
+Path resolution rules:
+- A **bare name** (`photos.db`) → inside `DIR` (the hashed directory).
+- A **path** (`./config/photos.db`, `../m.db`, `/abs/path.db`) → resolved
+  relative to your **current working directory**, *not* `DIR`.
+- The target directory must already exist; `--db` won't create folders.
+- The `.partial`, `.bak*`, and `.tmp` files always sit next to the db.
+
+If the db happens to land *inside* the hashed tree (e.g.
+`DIR/config/photos.db`), its family is still auto-excluded, so the
+manifest never hashes itself.
+
+**Important — foreign manifest files are treated as ordinary data.** The
+tool only auto-excludes *its own* manifest family (the one matching the
+`--db` name in use). If another manifest such as `hashes.db` or
+`hashes.db.partial` from a different directory is sitting in the folder,
+it will be hashed and recorded like any other file. To leave it out, add
+it to your ignores:
+
+```
+empire-file-hasher /path/to/archive --db photos.db \
+    --ignore hashes.db --ignore "hashes.db.*"
+```
+
+or put the equivalent lines in `.hashignore`.
+
+A partial from a *different* manifest is never mistaken for yours: the
+resume prompt only triggers on `<your-db-name>.partial`. So running with
+`--db photos.db` will not try to resume from a stray `hashes.db.partial`
+— that file is just treated as ordinary data (and hashed unless ignored,
+per above).
 
 ### Rehashing
 
