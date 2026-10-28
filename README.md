@@ -24,7 +24,9 @@ failing drive. If a byte flips, this will tell you.
   type — videos, archives, ISOs, photos, documents, whatever.
 - Streams files in 64 KiB chunks, so terabyte-scale archives are fine.
 - Manifest format matches `sha256sum`: `<hex>  <relative/path>` per line, so
-  you can also verify with standard Unix tools:
+  you can also verify with standard Unix tools. Manifests written by
+  `sha256sum` itself are read too — text mode (`hash  file`), binary mode
+  (`sha256sum -b`, `hash *file`) and BSD style (`SHA256 (file) = hash`):
 
   ```
   sha256sum -c hashes.db
@@ -76,15 +78,21 @@ empire-file-hasher --diff OLD.db NEW.db
   Increase for fast storage (NVMe / SSD) to overlap I/O with hashing.
   Leave at `1` for spinning disks or network mounts, where seek contention
   usually makes parallel hashing *slower*.
-- `-i PATH` / `--ignore PATH` — skip a path. Repeatable. A trailing `/`
-  matches a directory subtree; otherwise the entry matches that exact file
-  or directory. See [Ignoring files](#ignoring-files) below.
+- `-i PATH` / `--ignore PATH` — skip a path or glob. Repeatable. If it
+  matches a directory, everything beneath it is skipped too (with or
+  without a trailing `/`). See [Ignoring files](#ignoring-files) below.
 - `--ignore-file F` — read ignore patterns from `F` instead of the default
   `DIR/.hashignore`. Resolved relative to your current working directory.
   If you point at a file that doesn't exist, that's an error.
+- `--no-backup` — don't back up the manifest before update or rehash
+  writes a new one. Existing backups are left alone.
+- `--keep-backups N` — keep only the newest `N` backups (`N` ≥ 1,
+  counting `hashes.db.bak`); older timestamped ones are deleted after each
+  new backup. Default: keep every backup. Can't be combined with
+  `--no-backup`. See [Rehashing](#rehashing) for how backups are named.
 - `-q` / `--quiet` — suppress per-file output and the progress line.
-  Final report still prints. Combine with the `update` mode's exit code
-  for cron / CI use.
+  Final report and warnings still print. Combine with the exit code for
+  cron / CI use.
 - `-v` / `--verbose` — print every file as it's processed (the old default
   behavior). Useful when piping to a log.
 - `--diff OLD.db NEW.db` — compare two manifest files and print added /
@@ -94,8 +102,10 @@ By default (no `-q`/`-v`), hashing and verification print a single
 self-updating progress line `[N/total] XX.X%` instead of one line per
 file — much friendlier for archives with tens of thousands of entries.
 
-**Exit codes**: `0` on success, `1` on integrity failure (verify found
-mismatches/missing, or `--diff` found differences), `2` on argument errors.
+**Exit codes**: `0` on success, `1` on integrity failure (verify or update
+found mismatched, missing, or unreadable files; hashing couldn't read some
+paths; or `--diff` found differences), `2` on argument errors (including an
+invalid ignore glob).
 
 ```
 # hash the current directory, single-threaded (default)
@@ -112,7 +122,7 @@ java -jar /path/to/empire-file-hasher/build/libs/empire-file-hasher.jar /path/to
 First run:
 
 ```
-No hashes.db found in this directory.
+No manifest found at /path/to/archive/hashes.db.
 Do you want to hash every file here (recursively) and create one? [y/N]: y
   [1/3] movies/trip-2025.mkv
   [2/3] photos/raw/IMG_0001.CR2
@@ -134,6 +144,7 @@ Choice: v
   OK         : 1234
   Mismatched : 2
   Missing    : 1
+  Unreadable : 0
   New/Extra  : 47
 
 Status: INTEGRITY CHECK FAILED
@@ -142,28 +153,44 @@ Status: INTEGRITY CHECK FAILED
   Note: 47 NEW file(s) on disk are NOT a failure — use [u] update to add them to the manifest.
 
 View details?
-  [1] Show MISMATCH entries (2)
-  [2] Show MISSING entries  (1)
-  [3] Show NEW entries      (47)
+  [1] Show MISMATCH entries   (2)
+  [2] Show MISSING entries    (1)
+  [3] Show NEW entries        (47)
+  [4] Show UNREADABLE entries (0)
   [q] done
 Choice:
 ```
 
-The report classifies every path into four states:
+The report classifies every path into five states:
 - **OK** — file present, hash matches.
 - **MISMATCH** — file present, bytes changed since the manifest was written.
 - **MISSING** — file listed in manifest but not found on disk.
+- **UNREADABLE** — file or folder exists but couldn't be read (permission
+  denied, I/O error, replaced by a directory), so its integrity is unknown.
 - **NEW** — file on disk that wasn't in the manifest (added after hashing).
 
-Only **MISMATCH** and **MISSING** cause an integrity failure (exit `1`).
+Two more things are reported when they happen:
+- **BAD LINE** — a manifest line that couldn't be parsed. Those entries
+  can't be checked, so this is a failure (exit `1`), and update refuses
+  to rewrite the manifest until the lines are fixed or removed.
+- **RENAMED** — on Windows/macOS (case-insensitive), a file renamed only
+  in letter case (`Photo.JPG` → `photo.jpg`). Not a failure; update
+  records the new name and keeps the hash.
+
+**MISMATCH**, **MISSING**, **UNREADABLE** and **BAD LINE** cause an integrity failure (exit `1`).
 **NEW** files are reported but do not fail the check — they're new content
 the manifest hasn't been told about yet. Use update mode to add them.
 
 The drill menu after the summary lets you inspect each category on
 demand, so you don't have to scroll through thousands of NEW lines just
-to find out what failed. Press `q` (or Enter) when done. The menu is
-skipped entirely in `--quiet` mode and exits cleanly if stdin is closed
+to find out what failed. Press `q` (or Enter) when done. The menu is shown
+whenever any category has entries, and exits cleanly if stdin is closed
 (safe for cron / piped invocations).
+
+In `--quiet` mode there's nobody to answer a menu, so instead the
+MISMATCH, MISSING and UNREADABLE paths are printed right after the
+summary (NEW files are only counted). With `-v`, each file's result is
+shown as it is checked (`[12/40] MISMATCH photos/a.jpg`).
 
 ### Interrupting a long run
 
@@ -182,9 +209,15 @@ Found a partial hash from a previous interrupted run: hashes.db.partial (4812 en
   [q] quit
 ```
 
-Resuming only hashes files not already in the partial. Files that were in
-the partial but no longer exist on disk are silently dropped (you'll see a
-"Dropped N partial entries" line if any).
+Resuming only hashes files not already in the partial, plus any file
+modified after the partial was saved (so an edit made between runs isn't
+recorded with its old hash). Files that were in
+the partial but no longer exist on disk (or are now ignored) are dropped
+(you'll see a "Dropped N partial entries" line if any).
+
+If hashing stops because of an unexpected error rather than Ctrl-C, the
+finished work is saved to the partial the same way and the real error is
+printed.
 
 Ctrl-C is **safe at any point in any mode** — `hashes.db` is written via
 an atomic temp-file rename, so it is never left half-written. The
@@ -241,9 +274,18 @@ Matching uses Java's standard glob syntax:
 - `*` matches any sequence of characters within a single path component.
 - `**` matches across path components (any depth, including zero).
 - `?` matches a single character; `[abc]` and `[a-z]` are character classes.
-- A trailing `/` means "match this directory and everything under it".
-- Without a trailing `/`, the entry matches that exact path (with whatever
-  globs you put in it).
+- An entry that matches a directory skips that directory and everything
+  under it. A trailing `/` is optional — `build` and `build/` behave the
+  same. Ignored directories aren't even opened, so an unreadable ignored
+  folder causes no warnings.
+- A line starting with `!` **re-includes** paths an earlier line ignored,
+  like `.gitignore`. Lines apply in order and the last match wins:
+  ```
+  build/
+  !build/release-notes.txt
+  ```
+  To ignore a name that really starts with `!`, write `\!name`.
+- An invalid glob (e.g. an unclosed `{`) is an error (exit `2`).
 - Patterns without `**` are anchored to the root — `build/` only matches
   a top-level `build/`. To match at any depth, use `**/build/`.
 - Leading `./` and `/` are stripped; backslashes are normalized to `/`,
@@ -274,13 +316,20 @@ to catch — silently overwriting the hash would defeat the point. Resolve
 mismatches manually (restore from backup) or use `[r]` rehash if you
 intend to declare the current bytes the new truth.
 
-The previous manifest is backed up to `hashes.db.bak` (timestamped if a
-backup already exists) before the new one is written.
+The previous manifest is backed up to `hashes.db.bak` before the new one
+is written (see [Rehashing](#rehashing) for how older backups are kept).
+
+Update exits `1` if problems remain afterwards — mismatched or unreadable
+files, new files that couldn't be read, or missing entries you chose to
+keep — so it can be used from cron.
 
 After the write, update prints an `=== Update summary ===` block (added
-/ removed / unchanged / mismatched counts + backup filename) followed by
-the same drill menu as verify — `[1]` ADDED, `[2]` REMOVED, `[3]`
-MISMATCH — so you can confirm exactly which paths were touched.
+/ removed / unchanged / mismatched counts + backup filename). It then
+shows a details menu — `[1]` ADDED, `[2]` REMOVED, `[3]` MISMATCH,
+`[4]` UNREADABLE, `[5]` MISSING (kept in manifest), `[6]` NEW (not added)
+— so you can confirm exactly which paths were touched and which weren't.
+The menu also appears when there was nothing to sync or you declined
+every change, so you can always see which files are mismatched.
 
 ### Diffing manifests
 
@@ -376,10 +425,49 @@ per above).
 
 Choosing `r` at the prompt overwrites `hashes.db`, so it's guarded by an
 extra "are you sure?" confirmation. Before the new manifest is written,
-the old one is copied to `hashes.db.bak`. If a `.bak` already exists, the
-backup is timestamped (`hashes.db.bak.20260422-172334`) so previous
-snapshots are never lost.
+the old one is copied to `hashes.db.bak`, so `.bak` is always the most
+recent backup. If a `.bak` already exists, it is first renamed with the
+time it was written (`hashes.db.bak.20260422-172334`, plus `-1`, `-2` …
+if needed) so previous snapshots are never lost.
 
+By default every backup is kept. To limit the pile-up:
+
+```
+# keep just the latest backup (hashes.db.bak)
+empire-file-hasher /path/to/archive --keep-backups 1
+
+# keep the 5 most recent
+empire-file-hasher /path/to/archive --keep-backups 5
+
+# skip backing up entirely for this run
+empire-file-hasher /path/to/archive --no-backup
+```
+
+`--keep-backups` only deletes files named exactly like the backups this
+tool creates (`hashes.db.bak.YYYYMMDD-HHMMSS[-n]`), so something like a
+hand-made `hashes.db.bak.old` is never touched.
+
+
+### Running from cron or scripts
+
+The menus read answers from stdin, so you can pipe them in:
+
+```
+echo v | java -jar empire-file-hasher.jar /path/to/archive -q
+```
+
+An invalid answer re-asks instead of quitting, and if input runs out
+before a choice is made the program exits `2` without doing anything —
+so a script answering the wrong question (for example when a leftover
+`.partial` triggers the resume prompt first) fails loudly instead of
+reporting success.
+
+Cron, systemd and Docker often run without a UTF-8 locale, in which Java
+can't read non-ASCII file names. The tool detects this and relaunches
+itself with `LC_ALL=C.UTF-8`; if that locale doesn't exist on the system
+it exits `2` and asks you to set a UTF-8 locale yourself. File names that
+aren't valid UTF-8 at all can't be stored in the manifest and are reported
+as unreadable.
 
 ## Notes
 
@@ -393,8 +481,18 @@ snapshots are never lost.
 - The manifest is plain UTF-8 text — safe to diff, grep, commit, copy to
   another medium alongside the archive. Despite the `.db` extension, it is
   **not** SQLite; it's just the same line format `sha256sum` emits.
-- **Symlinks are skipped** (not followed, not hashed). If your archive
-  contains symlinks you want preserved, resolve them to real files first.
+- **Symlinks are skipped** (not followed, not hashed) — both file and
+  directory links. If your archive contains symlinks you want preserved,
+  resolve them to real files first.
+- **Unreadable files and folders don't stop the run.** Hashing skips them,
+  lists them in a warning, and exits `1`; verify reports them as
+  UNREADABLE. Common culprits are `lost+found` on Linux drives and
+  `System Volume Information` on Windows drives — ignore them if expected.
+- File names containing a backslash or line break are escaped in the
+  manifest exactly like `sha256sum` does (the line starts with `\`), so
+  `sha256sum -c` still works.
+- The manifest is fsynced before it replaces the old one, so a power
+  loss can't leave behind an empty `hashes.db`.
 - **Empty folders are not tracked.** The manifest records files only, so
   an empty directory that later disappears will go unnoticed. Files inside
   a deleted folder are still reported individually as `MISSING`.

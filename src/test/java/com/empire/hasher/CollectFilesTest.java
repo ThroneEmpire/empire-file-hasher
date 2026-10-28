@@ -1,5 +1,6 @@
 package com.empire.hasher;
 
+import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -80,5 +81,52 @@ class CollectFilesTest {
         List<String> ignores = normalizeIgnores(List.of("**/*.tmp", "**/.cache/"));
         Set<String> got = relativeNames(root, Main.collectFiles(root, ignores));
         assertEquals(new TreeSet<>(Set.of("keep.txt", "deep/a/real.txt")), got);
+    }
+
+    @Test
+    void directoryIgnoredWithoutTrailingSlash(@TempDir Path root) throws Exception {
+        write(root.resolve("keep.txt"), "k");
+        write(root.resolve("build/out.bin"), "b");
+        write(root.resolve("build/nested/x.o"), "x");
+
+        Set<String> got = relativeNames(root, Main.collectFiles(root, normalizeIgnores(List.of("build"))));
+        assertEquals(new TreeSet<>(Set.of("keep.txt")), got);
+    }
+
+    @Test
+    void negationReIncludesFileInsideIgnoredDirectory(@TempDir Path root) throws Exception {
+        write(root.resolve("build/out.bin"), "b");
+        write(root.resolve("build/release-notes.txt"), "keep me");
+
+        List<String> ignores = normalizeIgnores(List.of("build/", "!build/release-notes.txt"));
+        Set<String> got = relativeNames(root, Main.collectFiles(root, ignores));
+        assertEquals(new TreeSet<>(Set.of("build/release-notes.txt")), got);
+    }
+
+    @Test
+    void symlinksAreSkipped(@TempDir Path root) throws Exception {
+        write(root.resolve("real.txt"), "r");
+        write(root.resolve("realdir/inner.txt"), "i");
+        try {
+            Files.createSymbolicLink(root.resolve("link.txt"), root.resolve("real.txt"));
+            Files.createSymbolicLink(root.resolve("linkdir"), root.resolve("realdir"));
+        } catch (UnsupportedOperationException | java.io.IOException e) {
+            Assumptions.abort("symlinks not supported here: " + e);
+        }
+
+        Set<String> got = relativeNames(root, Main.collectFiles(root, List.of()));
+        assertEquals(new TreeSet<>(Set.of("real.txt", "realdir/inner.txt")), got);
+    }
+
+    @Test
+    void backslashInUnixFilenameIsPreserved(@TempDir Path root) throws Exception {
+        Assumptions.assumeTrue("/".equals(root.getFileSystem().getSeparator()));
+        write(root.resolve("odd\\name.txt"), "o");
+
+        List<Path> files = Main.collectFiles(root, List.of());
+        assertEquals(1, files.size());
+        String rel = toRelative(root, files.get(0));
+        assertEquals("odd\\name.txt", rel);
+        assertTrue(Files.exists(root.resolve(rel)), "relative path must resolve back to the file");
     }
 }

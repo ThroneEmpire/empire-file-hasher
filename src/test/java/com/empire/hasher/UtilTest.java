@@ -63,6 +63,52 @@ class UtilTest {
     }
 
     @Test
+    void namesWithBackslashOrNewlineAreEscapedLikeSha256sum(@TempDir Path dir) throws Exception {
+        Path db = dir.resolve("hashes.db");
+        Map<String, String> in = new LinkedHashMap<>();
+        in.put("plain.txt", "aaa");
+        in.put("odd\\name.txt", "bbb");
+        in.put("two\nlines.txt", "ccc");
+        writeManifestAtomic(db, in);
+
+        List<String> lines = Files.readAllLines(db, StandardCharsets.UTF_8);
+        assertEquals(List.of("\\bbb  odd\\\\name.txt", "aaa  plain.txt", "\\ccc  two\\nlines.txt"), lines);
+        assertEquals(in, loadManifest(db));
+    }
+
+    @Test
+    void unescapedLegacyLinesAreReadLiterally(@TempDir Path dir) throws Exception {
+        Path db = dir.resolve("hashes.db");
+        Files.write(db, List.of("abc  dir/file\\n.txt"), StandardCharsets.UTF_8);
+        assertEquals(Map.of("dir/file\\n.txt", "abc"), loadManifest(db));
+    }
+
+    @Test
+    void readsBinaryModeAndBsdStyleLines(@TempDir Path dir) throws Exception {
+        Path db = dir.resolve("hashes.db");
+        Files.write(db, List.of(
+                "aaa *bin.txt",                      // sha256sum -b
+                "SHA256 (bsd file.txt) = BBB",       // sha256sum --tag / BSD
+                "\\ccc *odd\\\\name.txt"),               // escaped + binary mode
+                StandardCharsets.UTF_8);
+        Manifest m = readManifest(db);
+        assertEquals(Map.of("bin.txt", "aaa", "bsd file.txt", "BBB", "odd\\name.txt", "ccc"), m.entries());
+        assertTrue(m.malformed().isEmpty(), m.malformed().toString());
+    }
+
+    @Test
+    void malformedLinesAreReportedWithLineNumbers(@TempDir Path dir) throws Exception {
+        Path db = dir.resolve("hashes.db");
+        Files.write(db, List.of("aaa  ok.txt", "garbage", "bbb xmode.txt", "", "  leading-space.txt"),
+                StandardCharsets.UTF_8);
+        Manifest m = readManifest(db);
+        assertEquals(Map.of("ok.txt", "aaa"), m.entries());
+        assertEquals(3, m.malformed().size());
+        assertTrue(m.malformed().get(0).startsWith("line 2: "), m.malformed().get(0));
+        assertTrue(m.malformed().get(2).startsWith("line 5: "), m.malformed().get(2));
+    }
+
+    @Test
     void writeManifestAtomicLeavesNoTmpFile(@TempDir Path dir) throws Exception {
         Path db = dir.resolve("hashes.db");
         writeManifestAtomic(db, Map.of("a.txt", "deadbeef"));
@@ -100,7 +146,7 @@ class UtilTest {
     // --- ignore matching ---------------------------------------------------
 
     private static boolean ignored(String rel, String... patterns) {
-        List<PathMatcher> m = compileIgnoreMatchers(normalizeIgnores(Arrays.asList(patterns)));
+        List<IgnoreRule> m = compileIgnoreMatchers(normalizeIgnores(Arrays.asList(patterns)));
         return isIgnored(rel, m);
     }
 
@@ -129,6 +175,35 @@ class UtilTest {
     void literalFileMatch() {
         assertTrue(ignored("secrets.txt", "secrets.txt"));
         assertFalse(ignored("secrets.txt.bak", "secrets.txt"));
+    }
+
+    @Test
+    void patternWithoutTrailingSlashAlsoMatchesDirectorySubtree() {
+        assertTrue(ignored("build/x.o", "build"));
+        assertTrue(ignored("build/deep/x.o", "build"));
+        assertFalse(ignored("builder/x.o", "build"));
+    }
+
+    @Test
+    void negationReIncludesAndLastMatchWins() {
+        assertFalse(ignored("build/keep.txt", "build/", "!build/keep.txt"));
+        assertTrue(ignored("build/x.o", "build/", "!build/keep.txt"));
+        // Order matters: a later rule overrides an earlier negation.
+        assertTrue(ignored("a.log", "!a.log", "*.log"));
+        assertFalse(ignored("a.log", "*.log", "!a.log"));
+    }
+
+    @Test
+    void escapedBangMatchesLiteralName() {
+        assertTrue(ignored("!important.txt", "\\!important.txt"));
+        assertFalse(ignored("other.txt", "\\!important.txt"));
+    }
+
+    @Test
+    void invalidGlobIsReportedClearly() {
+        IllegalArgumentException e = assertThrows(IllegalArgumentException.class,
+                () -> compileIgnoreMatchers(normalizeIgnores(List.of("{unclosed"))));
+        assertTrue(e.getMessage().contains("{unclosed"), e.getMessage());
     }
 
     @Test
@@ -168,6 +243,7 @@ class UtilTest {
         assertTrue(isManifestFile(dir, name, ".partial", dir.resolve("hashes.db")));
         assertTrue(isManifestFile(dir, name, ".partial", dir.resolve("hashes.db.partial")));
         assertTrue(isManifestFile(dir, name, ".partial", dir.resolve("hashes.db.tmp")));
+        assertTrue(isManifestFile(dir, name, ".partial", dir.resolve("hashes.db.partial.tmp")));
         assertTrue(isManifestFile(dir, name, ".partial", dir.resolve("hashes.db.bak")));
         assertTrue(isManifestFile(dir, name, ".partial", dir.resolve("hashes.db.bak.20260101-000000")));
     }
